@@ -1,13 +1,16 @@
 package handlers
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 
 	"time"
 )
@@ -18,7 +21,7 @@ type SpotifyTokenResponse struct {
 	ExpiresIn   int    `json:"expires_in"`
 }
 
-func GetSpotifyToken(db *sql.DB, clientID, clientSecret, grant_type, redirectURI string, userID uint64) error {
+func GetSpotifyToken(db *pgx.Conn, clientID, clientSecret, grant_type, redirectURI string, userID uint64) error {
 	spotify_url := "https://accounts.spotify.com/api/token"
 	data := url.Values{}
 
@@ -43,31 +46,41 @@ func GetSpotifyToken(db *sql.DB, clientID, clientSecret, grant_type, redirectURI
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("spotify token request failed: %s", string(body))
 	}
-
 	var tokenResp SpotifyTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return err
 	}
 
+	var newUserID int64
+	err = db.QueryRow(
+		context.Background(),
+		"SELECT create_user($1, $2, $3)",
+		clientID, "Moj", "john@example.com",
+	).Scan(&newUserID)
+
+	if err != nil {
+		return fmt.Errorf("failed to create user: %w", err)
+	}
+
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 
-	query := `
-		INSERT INTO spotify_tokens (user_id, access_token, token_type, expires_at)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (user_id) DO UPDATE
-		SET access_token = EXCLUDED.access_token,
-		    token_type = EXCLUDED.token_type,
-		    expires_at = EXCLUDED.expires_at;
-	`
+	var token string
+	err = db.QueryRow(
+		context.Background(),
+		"CALL upsert_spotify_token($1, $2, $3, $4)",
+		newUserID, tokenResp.AccessToken, tokenResp.TokenType, expiresAt,
+	).Scan(&token)
+	if err != nil {
+		return fmt.Errorf("failed to upsert Spotify token: %w", err)
+	}
 
-	_, err = db.Exec(query, userID, tokenResp.AccessToken, tokenResp.TokenType, expiresAt)
 	return err
 }
 
-func CallbackHandler(db *sql.DB, clientID, grant_type, clientSecret, redirectURI string) http.HandlerFunc {
+func CallbackHandler(db *pgx.Conn, clientID, grant_type, clientSecret, redirectURI string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		userID := uint64(1)
+		userID := rand.Uint64()
 
 		err := GetSpotifyToken(db, clientID, clientSecret, grant_type, redirectURI, userID)
 		if err != nil {
